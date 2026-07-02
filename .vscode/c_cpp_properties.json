@@ -1,0 +1,27 @@
+//告诉 VS Code：你的工程在哪里找头文件、用了哪些宏、使用哪个编译器，这样 VS Code 才能正确地进行代码提示、跳转、语法检查。
+{
+    "configurations": [
+        {
+            "name": "bootloader",
+            "includePath": [
+                "firmware/cmsis/core",
+                "firmware/cmsis/device",
+                "firmware/driver/inc",
+                "driver"
+            ],
+            "defines": [
+                "STM32F40_41xxx",
+                "USE_STDPERIPH_DRIVER",
+                "HSE_VALUE=8000000"
+            ],
+            "compilerPath": "C:/Users/cjsy/Documents/gcc-arm-none-eabi-10.3-2021.10-win32/gcc-arm-none-eabi-10.3-2021.10/bin/arm-none-eabi-gcc.exe",
+            "intelliSenseMode": "windows-gcc-arm",
+            "cStandard": "c99",
+            "cppStandard": "c++11",
+            "browse": {
+                "limitSymbolsToIncludedHeaders": true
+            }
+        }
+    ],
+    "version": 4
+}
