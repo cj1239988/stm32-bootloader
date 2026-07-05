@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "stm32f4xx.h"
+#include "tim_delay.h"
 //0x801000->sp
 //0x801004->pc
 //SCB->VTOR
@@ -14,6 +15,8 @@ int main(void)
 {
     board_lowlevel_init();
     console_init();
+    tim_delay_init();
+
     bootloader_main();
 
     // extern void JumpApp(uint32_t base);

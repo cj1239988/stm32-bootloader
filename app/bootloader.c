@@ -1,56 +1,20 @@
-// 发送数据包
-// Op->=operation opcode操作码
-// 	HEADER	OPCODE	LENGTH	PAYLOAD
-// 长度（bytes）	1	1	2	n
-// 内容	0xAA	参考OPCODE	表示PAYLOAD的内容长度
-// OPCODE
-// 	NUM	PARAM	NOTE
-// ERASE（擦）	0x01	addr:地址（4bytes）
-// size:大小（4bytes）	擦除指定Flash区域内容
-// PROGRAM（写）	0x02	addr:地址（4bytes）
-// size:大小（4bytes）
-// data:待写入的数据	将data写入到addr地址，写入长度为size
-// VERIFY（校验）	0x03	addr:地址（4bytes）
-// size:大小（4bytes）
-// crc:校验和（4bytes）	校验Flash内容
-// BOOT
-// (boot跳转主程序的步骤)	0x04	addr:地址（4bytes）
-// 	从addr处引导主程序
-// 示例
-// //从0x08000000处擦除1024个字节的Flash的数据包原型
-// AA 01 08 00 00 00 00 08 00 04 00 00
-
-// //往0x08000020处写入14字节数据，数据内容为01 02 03 04.....0E
-// AA 02 16 00 02 00 00 08 14 00 00 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E
-
-// 响应数据包
-// 	HEADER	OPCODE	LENGTH	ERRCODE	PAYLOAD
-// 长度（bytes）	1	1	2	1	n
-// 内容	0x55	对应发送数据包的OPCODE	表示ERRCODE+PAYLOAD的内容长度	参考ERRCODE
-// ERRCODE
-// 	NUM	NOTE
-// OK	0	操作成功
-// ERR_OPCODE	1	OPCODE错误
-// ERR_OVERFLOW	2	数据接收长度溢出
-// ERR_TIMEOUT	3	操作超时
-// ERR_FORMAT	4	格式错误
-// ERR_VERIFY	5	校验错误
-// ERR_PARAM	6	参数错误
-// ERR_UNKNOWN	0xFF	未知异常
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include "bl_usart.h"
 #include "ringbuffer.h"
+#include "crc16.h"
+#include "tim_delay.h"
 
 #define RX_BUFFER_SIZE 1024
 #define PACKET_SIZE_MAX 4096
-
+#define RX_TIMEOUT_MS  20
 typedef enum {
     PACKET_STATE_HEADER,
     PACKET_STATE_OPCODE,
     PACKET_STATE_LENGTH,
     PACKET_STATE_PAYLOAD,
+    PACKET_STATE_CRC16,
 } packet_state_machine_t;
 
 typedef enum
@@ -84,7 +48,24 @@ static uint16_t packet_payload_length;
 
 static void bl_byte_handler(uint8_t byte)
 {
+    //处理字节数据超时接收
+    static uint64_t last_byte_ms;
+    uint64_t now_ms = tim_get_ms();
+    if (now_ms - last_byte_ms > RX_TIMEOUT_MS)
+    {
+        if(packet_state != PACKET_STATE_HEADER)
+        {
+            printf("last packet rx timeout\n");
+        }
+        // 超时处理：重置状态机
+        packet_index = 0;
+        packet_state = PACKET_STATE_HEADER;
+    }
+    last_byte_ms = now_ms;
+
     printf("recv: %02X\n", byte);
+
+    //字节接收状态机处理
     packet_buffer[packet_index++] = byte;// 将接收到的数据存入缓冲区
     switch(packet_state)
     {
@@ -136,16 +117,34 @@ static void bl_byte_handler(uint8_t byte)
         case PACKET_STATE_PAYLOAD:
             if(packet_index == 4 + packet_payload_length)
             {
-                printf("payload ok\n");
-                printf("packet received: opcode=%02X, length=%d\n", packet_opcode, packet_payload_length);
-                printf("payload: ");
-                for(uint32_t i = 0; i < packet_payload_length; i++)
+                printf("payload received ok\n");
+
+                packet_state = PACKET_STATE_CRC16;
+            }
+            break;
+        case PACKET_STATE_CRC16:
+            if(packet_index == 4 + packet_payload_length+2)
+            {
+                uint16_t crc = (packet_buffer[4 + packet_payload_length + 1] << 8) | packet_buffer[4 + packet_payload_length];
+                uint16_t ccrc = crc16(packet_buffer, 4 + packet_payload_length);
+                if(crc == ccrc)
                 {
-                    printf("%02X ", packet_buffer[4 + i]);
+                    printf("crc16 ok:%04x\n",crc);
+                    printf("packet received: opcode=%02X, length=%d\n", packet_opcode, packet_payload_length);
+                    printf("payload: ");
+                    for(uint32_t i = 0; i < packet_payload_length; i++)
+                    {
+                        printf("%02X ", packet_buffer[4 + i]);
+                    }
+                    printf("\n");
                 }
-                printf("\n");
-                packet_index = 0; // 重置索引
-                packet_state = PACKET_STATE_HEADER; // 重置状态机
+                else
+                {
+                    // 错误处理：CRC校验失败
+                    printf("crc16 error: expected %04X, got %04X\n", crc, ccrc);
+                }
+                packet_index=0;
+                packet_state=PACKET_STATE_HEADER;
             }
             break;
         default:

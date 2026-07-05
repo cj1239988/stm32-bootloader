@@ -408,6 +408,16 @@
               <FileType>1</FileType>
               <FilePath>..\app\ringbuffer.c</FilePath>
             </File>
+            <File>
+              <FileName>crc16.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\crc16.c</FilePath>
+            </File>
+            <File>
+              <FileName>tim_delay.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\tim_delay.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
