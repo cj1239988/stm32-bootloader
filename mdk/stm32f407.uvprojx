@@ -418,6 +418,16 @@
               <FileType>1</FileType>
               <FilePath>..\app\tim_delay.c</FilePath>
             </File>
+            <File>
+              <FileName>stm32_flash.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\stm32_flash.c</FilePath>
+            </File>
+            <File>
+              <FileName>crc32.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\crc32.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

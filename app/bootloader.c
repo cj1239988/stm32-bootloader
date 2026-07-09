@@ -1,11 +1,19 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include "stm32f4xx.h"
 #include "bl_usart.h"
 #include "ringbuffer.h"
 #include "crc16.h"
+#include "crc32.h"
 #include "tim_delay.h"
+#include "stm32_flash.h"
 
+#define BL_VERSION   "0.0.1"
+#define BL_ADDRESS   0x08000000
+#define BL_SIZE      (48*1024)//48KB
+#define APP_VTOR_ADDR    0x08010000
 #define RX_BUFFER_SIZE 1024
 #define PACKET_SIZE_MAX 4096
 #define RX_TIMEOUT_MS  20
@@ -19,11 +27,19 @@ typedef enum {
 
 typedef enum
 {
-    PACKET_OPCODE_ERASE = 0x01,
-    PACKET_OPCODE_PROGRAM = 0x02,
-    PACKET_OPCODE_VERIFY = 0x03,
-    PACKET_OPCODE_BOOT = 0x04,
+    PACKET_OPCODE_INQUERY = 0x01,
+    PACKET_OPCODE_ERASE = 0x81,
+    PACKET_OPCODE_PROGRAM = 0x82,
+    PACKET_OPCODE_VERIFY = 0x83,
+    PACKET_OPCODE_RESET = 0x21,
+    PACKET_OPCODE_BOOT = 0x22,
 }packet_opcode_t;
+
+typedef enum
+{
+    INQUERY_SUBCODE_VERSION=0x00,
+    INQUERY_SUBCODE_MTU=0x01,
+}inquery_subcode_t;
 
 typedef enum
 {
@@ -46,8 +62,247 @@ static packet_state_machine_t packet_state = PACKET_STATE_HEADER;
 static packet_opcode_t packet_opcode;
 static uint16_t packet_payload_length;
 
-static void bl_byte_handler(uint8_t byte)
+static void bl_response(packet_opcode_t opcode, packet_errcode_t errcode, const uint8_t *data, uint16_t length)
 {
+    uint8_t *response = packet_buffer;
+    response[0] = 0x55; // Header
+    response[1] = opcode; // Opcode
+    response[2] = errcode; // Error code
+    response[3] = (uint8_t)(length & 0xFF); // Length LSB
+    response[4] = (uint8_t)((length >> 8) & 0xFF); // Length MSB
+    if(length > 0 ) memcpy(&response[5], data, length); // Payload
+    uint16_t crc = crc16(response, 5 + length);
+    response[5 + length] = (uint8_t)(crc & 0xFF); // CRC LSB
+    response[6 + length] = (uint8_t)((crc >> 8) & 0xFF); // CRC MSB
+
+    bl_usart_write(response, 7 + length); // Send the response
+}
+
+//static inline void bl_response_ack(packet_opcode_t opcode, packet_errcode_t errcode)
+//{
+//    bl_response(opcode, errcode, NULL, 0);
+//}
+
+static void bl_opcode_inquery_handler(void)
+{
+    printf("inquery handler\n");
+
+    if(packet_payload_length != 1)
+    {
+        printf("inquery packet length error\n");
+        return;
+    }
+    uint8_t subcode=packet_buffer[4];
+    switch(subcode)
+    {
+        case INQUERY_SUBCODE_VERSION:
+        {
+           bl_response(PACKET_OPCODE_INQUERY, PACKET_ERRCODE_OK, (const uint8_t *)BL_VERSION, strlen(BL_VERSION));
+            break;
+        }
+        case INQUERY_SUBCODE_MTU:
+        {
+            uint8_t bmtu[2]={(uint8_t)(PACKET_SIZE_MAX & 0xFF), (uint8_t)((PACKET_SIZE_MAX >> 8) & 0xFF)};
+            bl_response(PACKET_OPCODE_INQUERY, PACKET_ERRCODE_OK, (const uint8_t *)&bmtu, sizeof(bmtu));
+            break;
+        }
+        default:
+        {
+            printf("unknown inquery subcode: %02X\n", subcode);
+            break;
+        }
+    }
+
+}
+
+static void bl_opcode_erase_handler(void)
+{
+   printf("erase handler\n");
+
+
+   if(packet_payload_length != 8)
+   {
+       printf("erase packet length error:%d\n", packet_payload_length);// 检查数据包长度是否为8字节
+       bl_response(PACKET_OPCODE_ERASE, PACKET_ERRCODE_PARAM, NULL, 0);// 发送错误响应
+       return;
+   }
+
+   uint32_t address=(packet_buffer[4]) | (packet_buffer[5] << 8) | (packet_buffer[6] << 16) | (packet_buffer[7] << 24);
+   uint32_t size=(packet_buffer[8]) | (packet_buffer[9] << 8) | (packet_buffer[10] << 16) | (packet_buffer[11] << 24);
+
+   if(address < STM32_FLASH_BASE || address + size > STM32_FLASH_BASE + STM32_FLASH_SIZE|| size == 0)// 检查地址和大小是否在合法范围内
+   {
+        printf("address 0x%08X,size=%u is out of range\n", address,size);
+        bl_response(PACKET_OPCODE_ERASE,PACKET_ERRCODE_PARAM,NULL,0);
+        return;
+
+   }
+
+   if(address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE)
+   {
+        printf("address 0x%08X,size=%u is protected\n", address,size);
+        bl_response(PACKET_OPCODE_ERASE,PACKET_ERRCODE_PARAM,NULL,0);
+        return;
+   }
+
+   printf("erase address: 0x%08X, size: %d\n", address, size);
+
+   stm32_flash_unlock();
+   stm32_flash_erase(address, size);
+   stm32_flash_lock();
+
+   bl_response(PACKET_OPCODE_ERASE, PACKET_ERRCODE_OK, NULL, 0);
+
+}
+
+static void bl_opcode_program_handler(void)
+{
+   printf("program handler\n");
+
+   if(packet_payload_length <= 8)
+   {
+       printf("program packet length error:%d\n", packet_payload_length);// 检查数据包长度是否大于8字节
+       bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_PARAM, NULL, 0);
+       return;
+   }
+
+   uint32_t address=(packet_buffer[4]) | (packet_buffer[5] << 8) | (packet_buffer[6] << 16) | (packet_buffer[7] << 24);
+   uint32_t size=(packet_buffer[8]) | (packet_buffer[9] << 8) | (packet_buffer[10] << 16) | (packet_buffer[11] << 24);
+   uint8_t *data = &packet_buffer[12];
+
+   if(address < STM32_FLASH_BASE || address + size > STM32_FLASH_BASE + STM32_FLASH_SIZE|| size == 0)// 检查地址和大小是否在合法范围内
+   {
+        printf("address 0x%08X,size=%u is out of range\n", address,size);
+        bl_response(PACKET_OPCODE_PROGRAM,PACKET_ERRCODE_PARAM,NULL,0);
+        return;
+
+   }
+
+   if(address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE)
+   {
+        printf("program address 0x%08X,size=%u is protected\n", address,size);
+        bl_response(PACKET_OPCODE_PROGRAM,PACKET_ERRCODE_PARAM,NULL,0);
+        return;
+   }
+
+   if(size != packet_payload_length - 8)
+   {
+       printf("program program size mismatch: %u != %u\n", size, packet_payload_length - 8);
+       bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_PARAM, NULL, 0);
+       return;
+   }
+
+   printf("program address: 0x%08X, size: %d\n", address, size);
+
+   stm32_flash_unlock();
+   stm32_flash_program(address, data, size);
+   stm32_flash_lock();
+
+   bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_OK, NULL, 0);
+}
+
+
+static void bl_opcode_verify_handler(void)
+{
+   printf("verify handler\n");
+
+   if(packet_payload_length != 12)
+   {
+       printf("verify packet length error:%d\n", packet_payload_length);// 检查数据包长度是否大于8字节
+       bl_response(PACKET_OPCODE_VERIFY, PACKET_ERRCODE_PARAM, NULL, 0);
+       return;
+   }
+
+   uint32_t address=(packet_buffer[4]) | (packet_buffer[5] << 8) | (packet_buffer[6] << 16) | (packet_buffer[7] << 24);
+   uint32_t size=(packet_buffer[8]) | (packet_buffer[9] << 8) | (packet_buffer[10] << 16) | (packet_buffer[11] << 24);
+   uint32_t crc=(packet_buffer[12]) | (packet_buffer[13] << 8) | (packet_buffer[14] << 16) | (packet_buffer[15] << 24);
+
+   if(address < STM32_FLASH_BASE || address + size > STM32_FLASH_BASE + STM32_FLASH_SIZE|| size == 0)// 检查地址和大小是否在合法范围内
+   {
+        printf("verify address 0x%08X,size=%u is out of range\n", address,size);
+        bl_response(PACKET_OPCODE_VERIFY,PACKET_ERRCODE_PARAM,NULL,0);
+        return;
+
+   }
+
+   printf("verify address=0x%08X, size=%u, crc=0x%08X\n", address, size, crc);
+
+   uint32_t ccrc = crc32((uint8_t *)address, size);
+
+   if(ccrc!=crc)
+   {
+       printf("verify crc error: expected %08X, got %08X\n", crc, ccrc);
+       bl_response(PACKET_OPCODE_VERIFY, PACKET_ERRCODE_VERIFY, NULL, 0);
+       return;
+   }
+   bl_response(PACKET_OPCODE_VERIFY, PACKET_ERRCODE_OK, NULL, 0);
+}
+static void bl_opcode_reset_handler(void)
+{
+    printf("reset handler\n");
+    bl_response(PACKET_OPCODE_RESET, PACKET_ERRCODE_OK, NULL, 0);
+    printf("system resetting... \n");
+    tim_delay_ms(2); // 延时以确保响应发送完成
+
+
+    NVIC_SystemReset(); // 调用系统复位函数
+
+}
+static void bl_opcode_boot_handler(void)
+{
+    printf("boot handler\n");
+    bl_response(PACKET_OPCODE_BOOT, PACKET_ERRCODE_OK, NULL, 0);
+    printf("booting application... \n");
+
+    USART_DeInit(USART1); // 反初始化 USART1
+    USART_DeInit(USART3); // 反初始化 USART3
+    TIM_DeInit(TIM6); // 停止定时器6
+    NVIC_DisableIRQ(TIM6_DAC_IRQn); // 禁用 TIM6 中断
+    NVIC_DisableIRQ(USART1_IRQn); // 禁用 USART1 中断
+    NVIC_DisableIRQ(USART3_IRQn); // 禁用 USART3 中断
+
+    SCB->VTOR = APP_VTOR_ADDR; // 设置向量表偏移寄存器为应用程序的基地址
+    extern void JumpApp(uint32_t base);// 声明跳转到应用程序的函数
+    JumpApp(APP_VTOR_ADDR);// 调用跳转函数，传入应用程序的基地址
+}
+static void bl_packet_handler(void)
+{
+    switch(packet_opcode)
+    {
+        case PACKET_OPCODE_INQUERY:
+            // 处理查询操作
+            bl_opcode_inquery_handler();
+            break;
+        case PACKET_OPCODE_ERASE:
+            // 处理擦除操作
+            bl_opcode_erase_handler();
+            break;
+        case PACKET_OPCODE_PROGRAM:
+            // 处理编程操作
+            bl_opcode_program_handler();
+            break;
+        case PACKET_OPCODE_VERIFY:
+            // 处理校验操作
+            bl_opcode_verify_handler();
+            break;
+        case PACKET_OPCODE_RESET:
+            // 处理复位操作
+            bl_opcode_reset_handler();
+            break;
+        case PACKET_OPCODE_BOOT:
+            // 处理启动操作
+            bl_opcode_boot_handler();
+            break;
+        default:
+            // 错误处理：未知的操作码
+            printf("unknown opcode: %02X\n", packet_opcode);
+            break;
+    }
+}
+
+static bool bl_byte_handler(uint8_t byte)
+{
+    bool full_packet = false;//表示有没有收到一个完整的数据包
     //处理字节数据超时接收
     static uint64_t last_byte_ms;
     uint64_t now_ms = tim_get_ms();
@@ -82,7 +337,7 @@ static void bl_byte_handler(uint8_t byte)
             }
             break;
         case PACKET_STATE_OPCODE:
-            if(packet_buffer[1] == PACKET_OPCODE_ERASE || packet_buffer[1] == PACKET_OPCODE_PROGRAM || packet_buffer[1] == PACKET_OPCODE_VERIFY || packet_buffer[1] == PACKET_OPCODE_BOOT)
+            if(packet_buffer[1] == PACKET_OPCODE_ERASE || packet_buffer[1] == PACKET_OPCODE_PROGRAM || packet_buffer[1] == PACKET_OPCODE_VERIFY || packet_buffer[1] == PACKET_OPCODE_BOOT|| packet_buffer[1] == PACKET_OPCODE_RESET || packet_buffer[1] == PACKET_OPCODE_INQUERY)
             {
                 printf("opcode ok: %02X\n", packet_buffer[1]);
                 packet_opcode = (packet_opcode_t)packet_buffer[1];
@@ -104,7 +359,10 @@ static void bl_byte_handler(uint8_t byte)
                 {
                     printf("length ok: %d\n", payload_length);
                     packet_payload_length = payload_length;
-                    packet_state = PACKET_STATE_PAYLOAD; // 进入数据负载状态
+                    if(payload_length >0)
+                        packet_state = PACKET_STATE_PAYLOAD; // 否则进入数据负载状态
+                    else
+                        packet_state = PACKET_STATE_CRC16; // 如果没有负载，直接进入CRC16状态
                 }
                 else
                 {
@@ -129,6 +387,7 @@ static void bl_byte_handler(uint8_t byte)
                 uint16_t ccrc = crc16(packet_buffer, 4 + packet_payload_length);
                 if(crc == ccrc)
                 {
+                    full_packet = true; // 收到一个完整且有效的数据包
                     printf("crc16 ok:%04x\n",crc);
                     printf("packet received: opcode=%02X, length=%d\n", packet_opcode, packet_payload_length);
                     printf("payload: ");
@@ -150,7 +409,7 @@ static void bl_byte_handler(uint8_t byte)
         default:
             break;
     }
-
+    return full_packet;
 }
 
 static void bl_usart_rx_handler(const uint8_t *data, uint32_t length)
@@ -171,7 +430,10 @@ void bootloader_main(void)
         {
             uint8_t byte;
             rb_get(rxrb, &byte); // 从环形缓冲区获取一个字节
-            bl_byte_handler(byte); // 处理接收到的字节
+            if(bl_byte_handler(byte)) // 处理接收到的字节
+            {
+                bl_packet_handler();
+            }
         }
 
     }
