@@ -9,14 +9,18 @@
 #include "crc32.h"
 #include "tim_delay.h"
 #include "stm32_flash.h"
+#include "board.h"
+#include "tim_delay.h"
 
 #define BL_VERSION   "0.0.1"
 #define BL_ADDRESS   0x08000000
 #define BL_SIZE      (48*1024)//48KB
 #define APP_VTOR_ADDR    0x08010000
-#define RX_BUFFER_SIZE 1024
-#define PACKET_SIZE_MAX 4096
+#define RX_BUFFER_SIZE 5*1024
+#define PAYLOAD_SIZE_MAX (4096+8)// 4KB为program数据最大长度，8字节为program的地址(4)和长度(4)
+#define PACKET_SIZE_MAX  (PAYLOAD_SIZE_MAX + 4 + 2) // 4字节头部+2字节CRC16
 #define RX_TIMEOUT_MS  20
+#define BOOTLOADER_DELAY 3000
 typedef enum {
     PACKET_STATE_HEADER,
     PACKET_STATE_OPCODE,
@@ -62,6 +66,25 @@ static packet_state_machine_t packet_state = PACKET_STATE_HEADER;
 static packet_opcode_t packet_opcode;
 static uint16_t packet_payload_length;
 
+static void boot_application(void)
+{
+    printf("booting application... \n");
+    tim_delay_ms(2); // 延时以确保响应发送完成
+
+    led_off(led1); // 关闭LED1指示灯
+    TIM_DeInit(TIM6); // 停止定时器6
+    USART_DeInit(USART1); // 反初始化 USART1
+    USART_DeInit(USART3); // 反初始化 USART3
+
+    NVIC_DisableIRQ(TIM6_DAC_IRQn); // 禁用 TIM6 中断
+    NVIC_DisableIRQ(USART1_IRQn); // 禁用 USART1 中断
+    NVIC_DisableIRQ(USART3_IRQn); // 禁用 USART3 中断
+
+    SCB->VTOR = APP_VTOR_ADDR; // 设置向量表偏移寄存器为应用程序的基地址
+    extern void JumpApp(uint32_t base);// 声明跳转到应用程序的函数
+    JumpApp(APP_VTOR_ADDR);// 调用跳转函数，传入应用程序的基地址
+}
+
 static void bl_response(packet_opcode_t opcode, packet_errcode_t errcode, const uint8_t *data, uint16_t length)
 {
     uint8_t *response = packet_buffer;
@@ -102,7 +125,7 @@ static void bl_opcode_inquery_handler(void)
         }
         case INQUERY_SUBCODE_MTU:
         {
-            uint8_t bmtu[2]={(uint8_t)(PACKET_SIZE_MAX & 0xFF), (uint8_t)((PACKET_SIZE_MAX >> 8) & 0xFF)};
+            uint8_t bmtu[2]={(uint8_t)(PAYLOAD_SIZE_MAX & 0xFF), (uint8_t)((PAYLOAD_SIZE_MAX >> 8) & 0xFF)};
             bl_response(PACKET_OPCODE_INQUERY, PACKET_ERRCODE_OK, (const uint8_t *)&bmtu, sizeof(bmtu));
             break;
         }
@@ -194,9 +217,9 @@ static void bl_opcode_program_handler(void)
 
    printf("program address: 0x%08X, size: %d\n", address, size);
 
-   stm32_flash_unlock();
-   stm32_flash_program(address, data, size);
-   stm32_flash_lock();
+    stm32_flash_unlock();
+    stm32_flash_program(address, data, size);
+    stm32_flash_lock();
 
    bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_OK, NULL, 0);
 }
@@ -252,18 +275,7 @@ static void bl_opcode_boot_handler(void)
 {
     printf("boot handler\n");
     bl_response(PACKET_OPCODE_BOOT, PACKET_ERRCODE_OK, NULL, 0);
-    printf("booting application... \n");
-
-    USART_DeInit(USART1); // 反初始化 USART1
-    USART_DeInit(USART3); // 反初始化 USART3
-    TIM_DeInit(TIM6); // 停止定时器6
-    NVIC_DisableIRQ(TIM6_DAC_IRQn); // 禁用 TIM6 中断
-    NVIC_DisableIRQ(USART1_IRQn); // 禁用 USART1 中断
-    NVIC_DisableIRQ(USART3_IRQn); // 禁用 USART3 中断
-
-    SCB->VTOR = APP_VTOR_ADDR; // 设置向量表偏移寄存器为应用程序的基地址
-    extern void JumpApp(uint32_t base);// 声明跳转到应用程序的函数
-    JumpApp(APP_VTOR_ADDR);// 调用跳转函数，传入应用程序的基地址
+    boot_application();
 }
 static void bl_packet_handler(void)
 {
@@ -318,7 +330,7 @@ static bool bl_byte_handler(uint8_t byte)
     }
     last_byte_ms = now_ms;
 
-    printf("recv: %02X\n", byte);
+    //printf("recv: %02X\n", byte);
 
     //字节接收状态机处理
     packet_buffer[packet_index++] = byte;// 将接收到的数据存入缓冲区
@@ -332,6 +344,7 @@ static bool bl_byte_handler(uint8_t byte)
             }
             else
             {
+                printf("header error: %02X\n", packet_buffer[0]);
                 packet_index = 0; // 重置索引
                 packet_state = PACKET_STATE_HEADER; // 重置状态机
             }
@@ -345,6 +358,7 @@ static bool bl_byte_handler(uint8_t byte)
             }
             else
             {
+                printf("opcode error: %02X\n", packet_buffer[1]);
                 // 错误处理：无效的操作码
                 packet_index = 0; // 重置索引
                 packet_state = PACKET_STATE_HEADER; // 重置状态机
@@ -355,7 +369,7 @@ static bool bl_byte_handler(uint8_t byte)
             {
 
                 uint16_t payload_length = (packet_buffer[3] << 8)|packet_buffer[2] ;
-                if(payload_length <= PACKET_SIZE_MAX - 4) // 检查是否溢出
+                if(payload_length <= PACKET_SIZE_MAX) // 检查是否溢出
                 {
                     printf("length ok: %d\n", payload_length);
                     packet_payload_length = payload_length;
@@ -366,6 +380,7 @@ static bool bl_byte_handler(uint8_t byte)
                 }
                 else
                 {
+                    printf("length error: %d\n", payload_length);
                     // 错误处理：数据包长度溢出
                     packet_index = 0; // 重置索引
                     packet_state = PACKET_STATE_HEADER; // 重置状态机
@@ -390,11 +405,11 @@ static bool bl_byte_handler(uint8_t byte)
                     full_packet = true; // 收到一个完整且有效的数据包
                     printf("crc16 ok:%04x\n",crc);
                     printf("packet received: opcode=%02X, length=%d\n", packet_opcode, packet_payload_length);
-                    printf("payload: ");
-                    for(uint32_t i = 0; i < packet_payload_length; i++)
-                    {
-                        printf("%02X ", packet_buffer[4 + i]);
-                    }
+                    // printf("payload: ");
+                    // for(uint32_t i = 0; i < packet_payload_length; i++)
+                    // {
+                    //     printf("%02X ", packet_buffer[4 + i]);
+                    // }
                     printf("\n");
                 }
                 else
@@ -417,15 +432,68 @@ static void bl_usart_rx_handler(const uint8_t *data, uint32_t length)
 
     rb_puts(rxrb, data, length); // 将接收到的数据放入环形缓冲区
 }
+
+static bool key_trap_check(void)
+{
+    for(uint32_t i=0;i<BOOTLOADER_DELAY;i+=10)
+    {
+        tim_delay_ms(10); // 延时10毫秒，避免按键抖动
+        if(!key_read(key2)) // 检查按键是否按下
+            return false; // 如果按键未按下，返回false
+
+    }
+
+    return true; // 如果按键在延时内一直按下，返回true
+}
+//等待按键释放
+static void wait_key_release(void)
+{
+    while(key_read(key2))
+    {
+        tim_delay_ms(10);
+    }
+}
+
+static bool key_press_check(void)
+{
+    if(!key_read(key2))
+        return false;
+    tim_delay_ms(10);//消抖
+    if(!key_read(key2))
+        return false;
+    return true;
+}
 void bootloader_main(void)
 {
     printf("Bootloader started.\n");
 
     rxrb = rb_new(rb_buffer, RX_BUFFER_SIZE);
     bl_usart_init();
-    bl_usart_register_rx_callback(bl_usart_rx_handler); // 注册接收回调函数
+    bl_usart_register_rx_callback(bl_usart_rx_handler);
+
+    key_init(key2);
+    bool trapboot=key_trap_check();
+    if(trapboot)
+    {
+        printf("Key2 pressed, entering bootloader mode.\n");
+    }
+    else
+    {
+        boot_application();
+    }
+    led_init(led1);
+    led_on(led1);
+    wait_key_release(); // 等待按键释放，避免误触发
+
     while(1)
     {
+        if(key_press_check())
+        {
+            printf("Key2 pressed, resetting system.\n");
+            tim_delay_ms(2); // 延时以确保响应发送完成
+            NVIC_SystemReset(); // 调用系统复位函数
+        }
+
         if(!rb_empty(rxrb))
         {
             uint8_t byte;
