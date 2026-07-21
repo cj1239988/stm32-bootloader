@@ -428,6 +428,11 @@
               <FileType>1</FileType>
               <FilePath>..\app\crc32.c</FilePath>
             </File>
+            <File>
+              <FileName>magic_header.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\magic_header.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

@@ -11,6 +11,7 @@
 #include "stm32_flash.h"
 #include "board.h"
 #include "tim_delay.h"
+#include "magic_header.h"
 
 #define BL_VERSION   "0.0.1"
 #define BL_ADDRESS   0x08000000
@@ -66,8 +67,33 @@ static packet_state_machine_t packet_state = PACKET_STATE_HEADER;
 static packet_opcode_t packet_opcode;
 static uint16_t packet_payload_length;
 
+static bool application_validate(void)
+{
+    if(!magic_header_validate())
+    {
+        printf("magic header invalid\n");
+        return false;
+    }
+    uint32_t addr=magic_header_get_address();
+    uint32_t size=magic_header_get_length();
+    uint32_t crc=magic_header_get_crc32();
+    uint32_t ccrc = crc32((uint8_t *)addr, size);
+    if(ccrc!=crc)
+    {
+        printf("application crc error: expected %08X, got %08X\n", crc, ccrc);
+        return false;
+    }
+    return true;
+}
+
 static void boot_application(void)
 {
+    //安全检查
+    if(!application_validate())
+    {
+        printf("application invalid, cannot boot.\n");
+        return;
+    }
     printf("booting application... \n");
     tim_delay_ms(2); // 延时以确保响应发送完成
 
@@ -442,7 +468,7 @@ static bool key_trap_check(void)
             return false; // 如果按键未按下，返回false
 
     }
-
+    printf("key2 pressed, trap boot mode.\n");
     return true; // 如果按键在延时内一直按下，返回true
 }
 //等待按键释放
@@ -463,6 +489,16 @@ static bool key_press_check(void)
         return false;
     return true;
 }
+
+bool magic_header_trap_boot(void)
+{
+    if(!application_validate())
+    {
+        printf("application invalid, trap boot mode.\n");
+        return true;
+    }
+    return false;
+}
 void bootloader_main(void)
 {
     printf("Bootloader started.\n");
@@ -473,11 +509,9 @@ void bootloader_main(void)
 
     key_init(key2);
     bool trapboot=key_trap_check();
-    if(trapboot)
-    {
-        printf("Key2 pressed, entering bootloader mode.\n");
-    }
-    else
+    if(!trapboot)
+        trapboot=magic_header_trap_boot();
+    if(!trapboot)
     {
         boot_application();
     }
