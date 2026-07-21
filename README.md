@@ -6,6 +6,8 @@
 
 项目按照功能模块逐步开发，每完成一个阶段都会进行 Git 提交，并记录对应的学习内容。
 
+当前版本在原有串口升级流程基础上增加了 Magic Header 机制，用于描述升级固件的类型、写入地址、长度、版本和 CRC 校验信息。Bootloader 启动 APP 前会先校验 Magic Header 和 APP 固件 CRC，避免错误固件、不完整固件或损坏固件被启动。
+
 ---
 
 ## 当前开发进度
@@ -38,48 +40,48 @@
 - 长按按键进入 Bootloader
 - 无升级操作时自动跳转 APP
 - Bootloader 模式下按键复位
+- Magic Header 固件信息描述
+- Python 脚本生成 `.xbin` 升级文件
+- 上位机解析并校验 Magic Header
+- APP 启动前 Magic Header 与固件 CRC 校验
 
 ---
 
-## 通信协议
+## Flash 分区
 
-所有多字节数据均采用小端格式发送，即低字节放在低地址，高字节放在高地址。
-
-单次传输的数据包大小不超过 Bootloader 支持的最大长度。
-
-### 请求数据包格式
-
-| 字段 | 长度 | 说明 |
+| 区域 | 地址 | 说明 |
 |------|------|------|
-| Header | 1 Byte | 固定为 `0xAA` |
-| Opcode | 1 Byte | 命令码 |
-| Length | 2 Bytes | Payload 长度，小端格式 |
-| Payload | n Bytes | 命令参数 |
-| CRC16 | 2 Bytes | 对 Header 到 Payload 的内容进行 CRC16 校验 |
+| Bootloader | `0x08000000` | Bootloader 程序区域 |
+| Magic Header | `0x0800C000` | 固件描述头存放区域 |
+| APP | `0x08010000` | 用户应用程序区域 |
 
-### 响应数据包格式
-
-| 字段 | 长度 | 说明 |
-|------|------|------|
-| Header | 1 Byte | 固定为 `0x55` |
-| Opcode | 1 Byte | 对应请求数据包的命令码 |
-| Error Code | 1 Byte | 命令执行结果 |
-| Length | 2 Bytes | Payload 长度，小端格式 |
-| Payload | n Bytes | 响应数据 |
-| CRC16 | 2 Bytes | 对 Header 到 Payload 的内容进行 CRC16 校验 |
+Bootloader 启动后会先判断是否需要进入升级模式。如果没有按键强制进入 Bootloader，则会检查 Magic Header 和 APP 固件 CRC。校验通过后跳转 APP，校验失败则停留在 Bootloader 等待重新升级。
 
 ---
 
-## 支持的命令
+## Magic Header 结构
 
-| 命令 | Opcode | 功能 |
-|------|--------|------|
-| INQUERY | `0x01` | 查询 Bootloader 信息 |
-| ERASE | `0x81` | 擦除指定 Flash 区域 |
-| PROGRAM | `0x82` | 向指定 Flash 地址写入数据 |
-| VERIFY | `0x83` | 对指定 Flash 区域进行 CRC32 校验 |
-| RESET | `0x21` | MCU 软件复位 |
-| BOOT | `0x22` | 跳转到 APP |
+Magic Header 用于描述升级包中的固件信息。Python 打包脚本、上位机和 Bootloader 使用同一套结构布局，保证三端解析结果一致。
+
+```c
+typedef struct {
+    uint32_t magic;          // 魔数，用于标识这是一个有效的魔术头
+    uint32_t bitmask;        // 位掩码，用于标识哪些字段是有效的
+    uint32_t reserved1[6];   // 保留字段，供将来使用
+
+    uint32_t data_type;      // 类型，根据 type 类型选择固件下载位置
+    uint32_t data_offset;    // 固件文件相对于 Magic Header 的偏移地址
+    uint32_t data_address;   // 固件实际写入 MCU Flash 的地址
+    uint32_t data_length;    // 固件长度
+    uint32_t data_crc32;     // 固件 CRC32 校验值
+    uint32_t reserved2[11];  // 保留字段，供将来使用
+
+    char version[128];       // 固件版本字符串
+
+    uint32_t reserved3[6];   // 保留字段，供将来使用
+    uint32_t this_address;   // 该结构体在 MCU Flash 中的实际地址
+    uint32_t this_crc32;     // 该结构体本身的 CRC32 校验值
+} magic_header_t;
 
 ### INQUERY
 
@@ -125,8 +127,8 @@ Payload 格式：
 
 | 字段 | 长度 | 说明 |
 |------|------|------|
-| Address | 4 Bytes | APP 固件起始地址，小端格式 |
-| Size | 4 Bytes | APP 固件长度，小端格式 |
+| Address | 4 Bytes | 校验起始地址，小端格式 |
+| Size | 4 Bytes | 校验长度，小端格式 |
 | CRC32 | 4 Bytes | 上位机计算得到的 CRC32，小端格式 |
 
 Bootloader 会重新计算指定 Flash 区域的 CRC32，并与上位机发送的 CRC32 进行比较。
@@ -141,7 +143,7 @@ RESET 命令用于触发 MCU 软件复位。
 
 BOOT 命令用于从 Bootloader 跳转到 APP。
 
-跳转前，Bootloader 会关闭相关外设和中断，设置中断向量表偏移地址，然后跳转到 APP 的入口地址执行应用程序。
+跳转前，Bootloader 会先校验 Magic Header 和 APP 固件 CRC。校验通过后，Bootloader 会关闭相关外设和中断，设置中断向量表偏移地址，然后跳转到 APP 的入口地址执行应用程序。
 
 ---
 
@@ -168,14 +170,18 @@ BOOT 命令用于从 Bootloader 跳转到 APP。
 2. Bootloader 检测按键是否持续按下 3 秒。
 3. 按键满足长按条件后，设备进入 Bootloader 升级模式。
 4. LED 点亮，表示设备已经进入升级模式。
-5. 上位机查询 Bootloader 版本。
-6. 上位机查询 Bootloader 支持的 MTU。
-7. 上位机发送 ERASE 命令擦除 APP 所在的 Flash 区域。
-8. 上位机根据 MTU 将固件拆分成多个数据块。
-9. 上位机循环发送 PROGRAM 命令，将固件写入 Flash。
-10. 固件写入完成后，上位机发送 VERIFY 命令进行 CRC32 校验。
-11. 校验成功后，上位机发送 BOOT 命令，或者由用户通过按键复位设备。
-12. Bootloader 关闭相关外设和中断，并跳转到 APP。
+5. 上位机选择 `.xbin` 升级文件，并解析 Magic Header。
+6. 上位机检查 Magic Header 魔数、Header CRC 和 APP 数据长度。
+7. 上位机查询 Bootloader 版本。
+8. 上位机查询 Bootloader 支持的 MTU。
+9. 上位机擦除并写入 Magic Header 到 `0x0800C000`。
+10. Header 写入完成后，上位机发送 VERIFY 命令进行 CRC32 校验。
+11. 上位机擦除 APP 所在的 Flash 区域。
+12. 上位机根据 MTU 将 APP 固件拆分成多个数据块。
+13. 上位机循环发送 PROGRAM 命令，将 APP 固件写入 `0x08010000`。
+14. APP 写入完成后，上位机发送 VERIFY 命令进行 CRC32 校验。
+15. 校验成功后，上位机发送 BOOT 命令启动新 APP。
+16. Bootloader 校验 Magic Header 和 APP 固件 CRC，关闭相关外设和中断，并跳转到 APP。
 
 ---
 
@@ -260,12 +266,23 @@ VERIFY 命令用于校验 APP 固件是否写入正确。
 
 如果两者一致，说明固件写入正确；如果两者不一致，Bootloader 会返回校验错误。
 
+### Magic Header 校验
+
+Magic Header 用于描述固件类型、写入地址、固件长度、版本号和 CRC32 校验值。
+
+上位机在烧录前会先解析 `.xbin` 文件中的 Magic Header，检查魔数、Header CRC 和 APP 数据长度。检查通过后，才会按照 Header 中记录的地址和长度进行擦除、写入和校验。
+
+Bootloader 启动 APP 前也会读取 `0x0800C000` 处的 Magic Header，先检查魔数是否为 `MAGI`，再计算 Header 自身 CRC32，并与 `this_crc32` 对比。Header 合法后，Bootloader 会继续读取 Header 中记录的 APP 地址、长度和 CRC32，对 APP 区域重新计算 CRC32。
+
+只有 Magic Header 和 APP 固件 CRC 都校验通过，Bootloader 才会跳转 APP。否则 Bootloader 会停留在升级模式，等待上位机重新烧录。
+
 ### 跳转 APP
 
 BOOT 命令用于从 Bootloader 跳转到 APP。
 
 跳转前，Bootloader 会进行以下处理：
 
+- 校验 Magic Header 和 APP 固件 CRC
 - 关闭 Bootloader 状态指示灯
 - 停止 Bootloader 使用的定时器
 - 反初始化相关 USART
@@ -280,7 +297,9 @@ BOOT 命令用于从 Bootloader 跳转到 APP。
 MCU 上电或复位后会检测升级按键状态。
 
 - 如果升级按键持续按下 3 秒，则进入 Bootloader 升级模式
-- 如果按键未按下或未持续按满 3 秒，则直接跳转到 APP
+- 如果按键未按下或未持续按满 3 秒，则检查 Magic Header 和 APP 固件 CRC
+- 如果 APP 合法，则直接跳转到 APP
+- 如果 APP 不合法，则停留在 Bootloader 等待升级
 - 进入 Bootloader 后会等待按键释放，避免同一次按键操作再次触发复位
 
 通过长按按键进入升级模式，可以避免设备每次启动都停留在 Bootloader 中，也能够降低误操作进入升级模式的概率。
@@ -298,15 +317,13 @@ MCU 上电或复位后会检测升级按键状态。
 
 跳转 APP 前，Bootloader 会关闭状态指示灯。
 
-后续可以继续扩展 LED 状态，例如使用不同的闪烁方式表示正在擦除、正在写入、校验成功或升级失败。
-
 ### 按键复位
 
 设备进入 Bootloader 后，再次按下升级按键会触发 MCU 软件复位。
 
 复位后，Bootloader 会重新检测按键状态：
 
-- 按键未持续按下 3 秒：启动 APP
+- 按键未持续按下 3 秒：检查 APP 合法性，合法则启动 APP
 - 按键持续按下 3 秒：再次进入 Bootloader
 
 这种方式允许用户在不使用串口调试命令的情况下，通过实体按键重新启动设备。
@@ -407,20 +424,20 @@ Bootloader 完成基本升级功能后，MCU 每次启动都需要确定是进�
 
 升级完成后，用户可以再次按下按键复位设备，使 Bootloader 重新执行启动判断并进入 APP。
 
----
+### 第六阶段：Magic Header 固件合法性校验
 
-## 后续开发计划
+新增内容：
 
-- [x] 按键选择 Bootloader 或 APP 启动模式
-- [x] LED 显示 Bootloader 运行状态
-- [ ] 完善上位机升级工具
-- [ ] 完整固件分包发送流程
-- [ ] 增加擦除、写入和校验过程的 LED 状态
-- [ ] APP 固件合法性检查
-- [ ] APP 启动前栈顶地址和复位入口检查
-- [ ] Flash 写入对齐和边界处理优化
-- [ ] 错误码和响应机制完善
-- [ ] 完整 IAP 升级流程测试
+- 增加 Magic Header 结构
+- 增加 Python 固件打包脚本
+- 生成 `.xbin` 升级文件
+- Header 中记录 APP 地址、长度、版本和 CRC32
+- 上位机烧录前解析并校验 Magic Header
+- Bootloader 启动 APP 前校验 Header 和 APP CRC
+
+实现效果：
+
+升级包具备自描述能力，上位机和 Bootloader 可以根据 Header 判断固件是否合法、应该写入哪里、写入多长以及校验值是多少。即使升级过程中断电或写入不完整，Bootloader 也能通过 CRC 校验发现 APP 无效，并停留在 Bootloader 等待重新升级。
 
 ---
 
