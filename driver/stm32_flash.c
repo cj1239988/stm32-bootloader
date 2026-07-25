@@ -10,6 +10,12 @@
 #include <stdint.h>
 #include "stm32f4xx.h"
 #include <stdio.h>
+#include "utils.h"
+
+#define LOG_TAG "flash"
+#define LOG_LVL  ELOG_LVL_INFO//
+#include "elog.h"
+
 #define FLASH_BASE_ADDRESS 0x08000000
 
 
@@ -49,14 +55,14 @@ void stm32_flash_unlock(void)
 void stm32_flash_erase(uint32_t address, uint32_t size)
 {
     uint32_t addr =FLASH_BASE_ADDRESS;
-    for(uint32_t i=0;i<sizeof(sector_descs)/sizeof(sector_desc_t);i++)
+    for(uint32_t i=0;i<ARRAY_SIZE(sector_descs);i++)
     {
         if(addr >= address && addr < address + size)
         {
-            printf("erasing sector %u at address 0x%08X size %u\n",i,addr,sector_descs[i].size);
+            log_i("erasing sector %u at address 0x%08X size %u",i,addr,sector_descs[i].size);
             if(FLASH_EraseSector(sector_descs[i].sector,VoltageRange_3)!=FLASH_COMPLETE)
             {
-                printf("flash erase error\n");
+                printf("flash erase error");
             }
         }
         addr+= sector_descs[i].size;
@@ -69,7 +75,7 @@ void stm32_flash_program(uint32_t address, const uint8_t *data, uint32_t size)
     {
         if(FLASH_ProgramWord(address+i,*(uint32_t *)(data+i)) != FLASH_COMPLETE)
         {
-            printf("flash program error at address 0x%08lx\n", address+i);
+            log_e("flash program error at address 0x%08lx", address+i);
         }
     }
 }

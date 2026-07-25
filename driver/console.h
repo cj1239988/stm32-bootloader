@@ -6,7 +6,7 @@
 typedef void (*console_received_func_t)(uint8_t data);
 
 void console_init(void);
-void console_write(const char str[]);
-void console_received_register(console_received_func_t func);
+void console_write(const char str[],uint32_t len);
+
 
 #endif /* __CONSOLE_H__ */
